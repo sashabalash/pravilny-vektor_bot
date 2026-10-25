@@ -1,0 +1,44 @@
+"""
+Middleware авторизации: для каждого события определяет пользователя в БД
+и признак администратора, блокирует доступ заблокированным пользователям.
+В хендлеры передаются аргументы db_user (dict | None), is_admin (bool) и teacher (dict | None).
+"""
+from typing import Any, Awaitable, Callable
+
+from aiogram import BaseMiddleware
+from aiogram.types import CallbackQuery, Message, TelegramObject
+
+from config import is_admin
+from database import db
+
+BLOCKED_TEXT = "🚫 Доступ к боту ограничен. Если это ошибка — напишите преподавателю: @Alexander_Balash"
+
+
+class AuthMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        tg_user = data.get("event_from_user")
+        data["db_user"] = None
+        data["is_admin"] = False
+        data["teacher"] = None
+
+        if tg_user is None:
+            return await handler(event, data)
+
+        data["is_admin"] = is_admin(tg_user.id)
+        db_user = await db.get_user(tg_user.id)
+        data["db_user"] = db_user
+        data["teacher"] = await db.get_teacher_by_telegram(tg_user.id)
+
+        if db_user and db_user["is_blocked"] and not data["is_admin"]:
+            if isinstance(event, CallbackQuery):
+                await event.answer(BLOCKED_TEXT, show_alert=True)
+            elif isinstance(event, Message):
+                await event.answer(BLOCKED_TEXT)
+            return None
+
+        return await handler(event, data)

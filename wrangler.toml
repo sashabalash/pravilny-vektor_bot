@@ -1,0 +1,3 @@
+name = "pravilny-vektor-bot"
+main = "bot.py"
+compatibility_date = "2026-10-25"

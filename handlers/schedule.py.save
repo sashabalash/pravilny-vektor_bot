@@ -1,0 +1,32 @@
+
+Расписание: команда /schedule и кнопка «Расписание» — ближайшие занятия ученика
+(родитель видит занятия своего ребёнка).
+"""
+from aiogram import F, Router
+from aiogram.filters import Command
+from aiogram.types import CallbackQuery, Message
+
+from database import db
+from keyboards.main_menu import back_to_menu_kb
+from utils import DB_DT_FORMAT, esc, fmt_dt, now_local
+
+router = Router(name="schedule")
+
+
+async def show_schedule(target: Message, db_user: dict | None) -> None:
+    if not db_user:
+        await target.answer("Сначала зарегистрируйтесь: /start")
+        return
+    student = await db.resolve_student(db_user)
+    if not student:
+        await target.answer(
+            f"ℹ️ Ученик «{esc(db_user['child_name'])}» пока не зарегистрирован в боте. "
+            "Когда он пройдёт регистрацию, расписание появится здесь.",
+            reply_markup=back_to_menu_kb())
+        return
+
+    now_str = now_local().strftime(DB_DT_FORMAT)
+    lessons = await db.get_upcoming_lessons(student["id"], now_str, limit=10)
+    if not lessons:
+        await target.answer(
+   
