@@ -4,3 +4,7 @@ bot.log*
 __pycache__/
 venv/
 .venv/
+.wrangler/
+*.zip
+*.save
+*.broken
