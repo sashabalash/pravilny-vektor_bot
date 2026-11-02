@@ -31,8 +31,13 @@ class Database:
     # ---------- Подключение ----------
 
     async def connect(self) -> None:
-        self.conn = await aiosqlite.connect(self.path)
+        self.conn = await aiosqlite.connect(self.path, timeout=10)
         self.conn.row_factory = aiosqlite.Row
+        # WAL: чтение не блокирует запись, запись не блокирует чтение.
+        # busy_timeout: подождать 5 секунд вместо мгновенной ошибки «database is locked».
+        await self.conn.execute("PRAGMA journal_mode = WAL")
+        await self.conn.execute("PRAGMA busy_timeout = 5000")
+        await self.conn.execute("PRAGMA synchronous = NORMAL")
         await self.conn.execute("PRAGMA foreign_keys = ON")
 
         # Защита от запуска на базе старой структуры: сначала нужна миграция
@@ -185,86 +190,53 @@ class Database:
         return await self.fetchall(
             "SELECT * FROM bookings WHERE status = ? ORDER BY id DESC LIMIT ?", (status, limit))
     
-    async def add_site_booking(
-        self,
-        token: str,
-        name: str,
-        phone: str,
-        lesson_format: str,
-        goal: str,
-        user_role: str,
-        subject: str | None = None,
-    ) -> int:
-        """Заявка с сайта: status='pending', source='site', telegram_id=0, username=NULL.
-
-        lesson_format / goal / subject — русские подписи из config (как в заявках из бота).
-        Бросает sqlite3.IntegrityError, если токен уже занят (уникальный индекс idx_bookings_token).
+    async def create_user_from_booking(self, booking_id: int) -> dict | None:
         """
-        async with aiosqlite.connect(DB_PATH, timeout=10) as conn:
-            cur = await conn.execute(
-                """
-                INSERT INTO bookings
-                    (telegram_id, username, name, phone, lesson_format, goal,
-                     subject, user_role, status, source, token, created_at)
-                VALUES (0, NULL, ?, ?, ?, ?, ?, ?, 'pending', 'site', ?, datetime('now'))
-                """,
-                (name, phone, lesson_format, goal, subject, user_role, token),
-            )
-            await conn.commit()
-            return cur.lastrowid
-
-    async def get_booking_by_token(self, token: str) -> dict | None:
-        """Только необработанная (pending) заявка — повторный переход по ссылке вернёт None."""
-        async with aiosqlite.connect(DB_PATH, timeout=10) as conn:
-            conn.row_factory = aiosqlite.Row
-            async with conn.execute(
-                "SELECT * FROM bookings WHERE token = ? AND status = 'pending'", (token,)
-            ) as cur:
-                row = await cur.fetchone()
-        return dict(row) if row else None
-
-    async def get_pending_site_booking(self, booking_id: int) -> dict | None:
-        """Заявка с сайта, ожидающая подтверждения, по id (для кнопок site:ok / site:edit)."""
-        async with aiosqlite.connect(DB_PATH, timeout=10) as conn:
-            conn.row_factory = aiosqlite.Row
-            async with conn.execute(
-                "SELECT * FROM bookings WHERE id = ? AND source = 'site' AND status = 'pending'",
-                (booking_id,),
-            ) as cur:
-                row = await cur.fetchone()
-        return dict(row) if row else None
-
-    async def confirm_booking(
-        self, booking_id: int, telegram_id: int, username: str | None = None
-    ) -> bool:
-        """pending → new и привязка к Telegram-аккаунту.
-
-        WHERE status='pending' делает подтверждение одноразовым: повторное нажатие вернёт False.
+        Заявка → ученик одним действием: создаёт пользователя с «пустым» telegram_id
+        (отрицательный id), чтобы история сохранилась, а при первом входе в бота
+        аккаунт привязался по номеру телефона (см. attach_telegram_by_phone).
         """
-        async with aiosqlite.connect(DB_PATH, timeout=10) as conn:
-            cur = await conn.execute(
-                """
-                UPDATE bookings
-                   SET status = 'new',
-                       telegram_id = ?,
-                       username = COALESCE(?, username)
-                 WHERE id = ? AND status = 'pending'
-                """,
-                (telegram_id, username, booking_id),
-            )
-            await conn.commit()
-            return cur.rowcount > 0
+        booking = await self.get_booking(booking_id)
+        if not booking:
+            return None
+        existing = await self.find_user_by_phone(booking["phone"])
+        if existing:
+            await self.set_booking_status(booking_id, "done")
+            return existing
+        role = "parent" if (booking["user_role"] or "").lower() == "parent" else "student"
+        placeholder_id = -max(1, booking_id)
+        try:
+            user_id = await self.execute(
+                "INSERT INTO users (telegram_id, username, role, full_name, phone, subject, created_at) "
+                "VALUES (?, NULL, ?, ?, ?, ?, ?)",
+                (placeholder_id, role, booking["name"], booking["phone"], booking["subject"], now_ts()))
+        except Exception:
+            logger.exception("Не удалось создать ученика из заявки #%s", booking_id)
+            return None
+        await self.set_booking_status(booking_id, "done")
+        return await self.get_user_by_id(user_id)
 
-    async def update_site_booking(self, booking_id: int, goal: str, lesson_format: str) -> bool:
-        """Ветка «✏️ Изменить»: правим цель и формат в ещё не подтверждённой заявке."""
-        async with aiosqlite.connect(DB_PATH, timeout=10) as conn:
-            cur = await conn.execute(
-                "UPDATE bookings SET goal = ?, lesson_format = ? WHERE id = ? AND status = 'pending'",
-                (goal, lesson_format, booking_id),
-            )
-            await conn.commit()
-            return cur.rowcount > 0
+    async def attach_telegram_by_phone(self, phone: str, telegram_id: int,
+                                       username: str | None) -> dict | None:
+        """Привязывает реальный Telegram к «заготовке» из заявки (telegram_id < 0)."""
+        user = await self.fetchone(
+            "SELECT * FROM users WHERE phone = ? AND telegram_id < 0 ORDER BY id LIMIT 1", (phone,))
+        if not user:
+            return None
+        await self.execute("UPDATE users SET telegram_id = ?, username = ? WHERE id = ?",
+                           (telegram_id, username, user["id"]))
+        return await self.get_user_by_id(user["id"])
 
+    async def stale_site_bookings(self, hours: int = 24) -> list[dict]:
+        """Заявки с сайта, которые висят дольше N часов и по которым ещё не напоминали."""
+        # created_at в bookings пишется через datetime('now') — это UTC, поэтому и граница в UTC
+        since = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+        return await self.fetchall(
+            "SELECT * FROM bookings WHERE status = 'pending' AND source = 'site' "
+            "AND reminded = 0 AND created_at <= ? ORDER BY created_at", (since,))
+
+    async def mark_booking_reminded(self, booking_id: int) -> None:
+        await self.execute("UPDATE bookings SET reminded = 1 WHERE id = ?", (booking_id,))
 
     async def set_booking_status(self, booking_id: int, status: str) -> None:
         await self.execute("UPDATE bookings SET status = ? WHERE id = ?", (status, booking_id))
@@ -295,12 +267,29 @@ class Database:
             (since_str, limit))
 
     async def set_lesson_status(self, lesson_id: int, status: str) -> None:
-        """Меняет статус занятия; при «проведено» списывает одно занятие с баланса."""
-        lesson = await self.fetchone("SELECT student_id FROM lessons WHERE id = ?", (lesson_id,))
-        await self.execute("UPDATE lessons SET status = ? WHERE id = ?", (status, lesson_id))
-        if status == "done" and lesson:
-            await self.execute(
-                "UPDATE users SET balance = MAX(balance - 1, 0) WHERE id = ?", (lesson["student_id"],))
+        """
+        Меняет статус занятия и синхронно ведёт баланс ученика.
+
+        • переход в «проведено» списывает одно занятие — ровно один раз (флаг lessons.charged);
+        • уход из «проведено» возвращает занятие на баланс;
+        • баланс может стать отрицательным: это долг, он показывается как «долг N зан.».
+        Изменение статуса и баланса выполняется одной транзакцией.
+        """
+        lesson = await self.fetchone(
+            "SELECT student_id, status, charged FROM lessons WHERE id = ?", (lesson_id,))
+        if not lesson:
+            return
+        charged = bool(lesson["charged"])
+        await self.conn.execute("UPDATE lessons SET status = ? WHERE id = ?", (status, lesson_id))
+        if status == "done" and not charged:
+            await self.conn.execute(
+                "UPDATE users SET balance = balance - 1 WHERE id = ?", (lesson["student_id"],))
+            await self.conn.execute("UPDATE lessons SET charged = 1 WHERE id = ?", (lesson_id,))
+        elif status != "done" and charged:
+            await self.conn.execute(
+                "UPDATE users SET balance = balance + 1 WHERE id = ?", (lesson["student_id"],))
+            await self.conn.execute("UPDATE lessons SET charged = 0 WHERE id = ?", (lesson_id,))
+        await self.conn.commit()
 
     async def lessons_to_remind(self, column: str, now_str: str, until_str: str) -> list[dict]:
         if column not in ("reminded_1h", "reminded_10m"):
@@ -554,6 +543,167 @@ class Database:
                 "SELECT COUNT(*) FROM submissions WHERE student_id = ? AND status = 'pending'", (student_id,)) or 0,
             "hw_unsubmitted": await self.count_unsubmitted(student_id),
         }
+
+    # ---------- Списки и карточка ученика (только чтение) ----------
+
+    async def count_users(self, role: str | None = None) -> int:
+        """Сколько пользователей: без role — ученики и родители (админы не считаются)."""
+        if role:
+            return await self._scalar("SELECT COUNT(*) FROM users WHERE role = ?", (role,)) or 0
+        return await self._scalar("SELECT COUNT(*) FROM users WHERE role != 'admin'") or 0
+
+    async def count_blocked(self) -> int:
+        return await self._scalar("SELECT COUNT(*) FROM users WHERE is_blocked = 1") or 0
+
+    async def list_users_page(self, role: str | None = None, offset: int = 0, limit: int = 9) -> list[dict]:
+        """Одна страница списка: ученики сверху, затем родители, внутри — по алфавиту."""
+        sql = "SELECT * FROM users"
+        params: list = []
+        if role:
+            sql += " WHERE role = ?"
+            params.append(role)
+        else:
+            sql += " WHERE role != 'admin'"
+        sql += (" ORDER BY CASE role WHEN 'student' THEN 0 ELSE 1 END, "
+                "full_name COLLATE NOCASE LIMIT ? OFFSET ?")
+        params += [limit, offset]
+        return await self.fetchall(sql, tuple(params))
+
+    async def find_user_by_phone(self, phone: str) -> dict | None:
+        """Пользователь по номеру телефона (для дедупликации заявок с сайта)."""
+        return await self.fetchone("SELECT * FROM users WHERE phone = ? ORDER BY id LIMIT 1", (phone,))
+
+    async def find_pending_site_booking_by_phone(self, phone: str, since: str) -> dict | None:
+        """Необработанная заявка с сайта по этому телефону, созданная после `since`."""
+        return await self.fetchone(
+            "SELECT * FROM bookings WHERE phone = ? AND status = 'pending' AND source = 'site' "
+            "AND created_at >= ? ORDER BY id DESC LIMIT 1", (phone, since))
+
+    async def search_users(self, query: str = "", role: str | None = None, offset: int = 0,
+                           limit: int = 9, debt_only: bool = False) -> tuple[list[dict], int]:
+        """
+        Поиск по имени, телефону или username + фильтр «с долгом».
+        Кириллица сравнивается в Python: SQLite LIKE не умеет регистр для неё.
+        Возвращает (страница, всего найдено).
+        """
+        sql = "SELECT * FROM users"
+        params: list = []
+        where: list[str] = []
+        if role:
+            where.append("role = ?")
+            params.append(role)
+        else:
+            where.append("role != 'admin'")
+        if debt_only:
+            where.append("balance < 0")
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY CASE role WHEN 'student' THEN 0 ELSE 1 END, full_name COLLATE NOCASE"
+        rows = await self.fetchall(sql, tuple(params))
+
+        needle = normalize_name(query)
+        digits = "".join(ch for ch in (query or "") if ch.isdigit())
+        if needle:
+            def matches(row: dict) -> bool:
+                if needle in normalize_name(row["full_name"]):
+                    return True
+                if digits and digits in "".join(ch for ch in (row["phone"] or "") if ch.isdigit()):
+                    return True
+                username = (row["username"] or "").lower()
+                return bool(username) and needle in normalize_name(username)
+
+            rows = [row for row in rows if matches(row)]
+        total = len(rows)
+        return rows[offset:offset + limit], total
+
+    async def has_lesson_conflict(self, student_id: int, lesson_dt: str,
+                                  teacher_id: int | None = None, window_minutes: int = 30) -> dict | None:
+        """
+        Ищет запланированное занятие ученика (или преподавателя) рядом с указанным временем.
+        Нужно, чтобы не поставить два урока в один слот.
+        """
+        try:
+            moment = datetime.strptime(lesson_dt, "%Y-%m-%d %H:%M")
+        except (ValueError, TypeError):
+            return None
+        start = (moment - timedelta(minutes=window_minutes)).strftime("%Y-%m-%d %H:%M")
+        end = (moment + timedelta(minutes=window_minutes)).strftime("%Y-%m-%d %H:%M")
+        return await self.fetchone(
+            "SELECT l.*, u.full_name AS student_name FROM lessons l JOIN users u ON u.id = l.student_id "
+            "WHERE l.status = 'scheduled' AND l.lesson_dt BETWEEN ? AND ? "
+            "AND (l.student_id = ? OR (? IS NOT NULL AND l.teacher_id = ?)) "
+            "ORDER BY l.lesson_dt LIMIT 1",
+            (start, end, student_id, teacher_id, teacher_id))
+
+    async def lessons_between(self, start: str, end: str) -> list[dict]:
+        """Занятия в интервале [start, end) — для сводки дня."""
+        return await self.fetchall(
+            "SELECT l.*, u.full_name AS student_name FROM lessons l JOIN users u ON u.id = l.student_id "
+            "WHERE l.lesson_dt >= ? AND l.lesson_dt < ? ORDER BY l.lesson_dt", (start, end))
+
+    async def packages_ending(self, until: str) -> list[dict]:
+        """Ученики, у которых пакет заканчивается не позже указанной даты."""
+        return await self.fetchall(
+            "SELECT * FROM users WHERE role = 'student' AND package_end IS NOT NULL "
+            "AND package_end <= ? ORDER BY package_end", (until,))
+
+    async def get_student_dashboard(self, student_id: int) -> dict:
+        """
+        Сводка по ученику для экрана статистики: занятия, ДЗ, оплаты, активность.
+        Только SELECT — схема и данные не меняются.
+        """
+        moment = now_local().strftime("%Y-%m-%d %H:%M")
+        statuses = {row["status"]: row["c"] for row in await self.fetchall(
+            "SELECT status, COUNT(*) AS c FROM lessons WHERE student_id = ? GROUP BY status",
+            (student_id,))}
+        done, missed = statuses.get("done", 0), statuses.get("missed", 0)
+        attended_base = done + missed
+        payments = await self.fetchone(
+            "SELECT COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS total FROM payments "
+            "WHERE user_id = ? AND status = 'paid'", (student_id,))
+        return {
+            "lessons": statuses,
+            "lessons_total": sum(statuses.values()),
+            "attendance": round(done * 100 / attended_base) if attended_base else None,
+            "next_lesson": await self.fetchone(
+                "SELECT * FROM lessons WHERE student_id = ? AND status = 'scheduled' AND lesson_dt >= ? "
+                "ORDER BY lesson_dt LIMIT 1", (student_id, moment)),
+            "last_lesson": await self.fetchone(
+                "SELECT * FROM lessons WHERE student_id = ? AND status = 'done' "
+                "ORDER BY lesson_dt DESC LIMIT 1", (student_id,)),
+            "payments_count": payments["cnt"],
+            "payments_sum": payments["total"],
+            "last_payment": await self.fetchone(
+                "SELECT * FROM payments WHERE user_id = ? AND status = 'paid' "
+                "ORDER BY paid_at DESC LIMIT 1", (student_id,)),
+            "avg_score": await self._scalar(
+                "SELECT AVG(score) FROM submissions WHERE student_id = ? AND score IS NOT NULL",
+                (student_id,)),
+            "hw_total": await self._scalar(
+                "SELECT COUNT(*) FROM homework WHERE student_id = ?", (student_id,)) or 0,
+            "hw_submitted": await self._scalar(
+                "SELECT COUNT(DISTINCT homework_id) FROM submissions WHERE student_id = ?",
+                (student_id,)) or 0,
+            "hw_pending": await self._scalar(
+                "SELECT COUNT(*) FROM submissions WHERE student_id = ? AND status = 'pending'",
+                (student_id,)) or 0,
+            "hw_unsubmitted": await self.count_unsubmitted(student_id),
+            "last_submission": await self.fetchone(
+                "SELECT * FROM submissions WHERE student_id = ? ORDER BY submitted_at DESC LIMIT 1",
+                (student_id,)),
+        }
+
+    async def get_student_lessons(self, student_id: int, limit: int = 8) -> list[dict]:
+        """Последние занятия ученика (новые сверху)."""
+        return await self.fetchall(
+            "SELECT * FROM lessons WHERE student_id = ? ORDER BY lesson_dt DESC LIMIT ?",
+            (student_id, limit))
+
+    async def get_student_payments(self, student_id: int, limit: int = 8) -> list[dict]:
+        """История оплат ученика (новые сверху)."""
+        return await self.fetchall(
+            "SELECT * FROM payments WHERE user_id = ? ORDER BY paid_at DESC LIMIT ?",
+            (student_id, limit))
 
     async def get_teacher_stats(self, teacher_id: int) -> dict:
         """Сводка по ученикам одного преподавателя: ученики, проведённые занятия, деньги."""

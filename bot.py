@@ -3,7 +3,9 @@
 Подключает БД, регистрирует роутеры и middleware, запускает планировщик и polling.
 """
 import asyncio
+import fcntl
 import logging
+import os
 import sys
 from logging.handlers import RotatingFileHandler
 
@@ -11,16 +13,17 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.exceptions import TelegramConflictError
 from aiogram.types import BotCommand, ErrorEvent
 
 from api import start_api
-from config import ADMIN_IDS, BOT_TOKEN, DB_PATH, LOG_FILE
+from config import ADMIN_IDS, BASE_DIR, BOT_TOKEN, DB_PATH, LOG_FILE
 from database import db
 from handlers import (admin, booking, faq, homework, materials, payment, registration, reports,
                       schedule, start)
 from middlewares.auth import AuthMiddleware
 from scheduler.reminders import setup_scheduler
-from schema_migration import migrate_bookings
+from schema_migration import migrate_bookings, migrate_lessons_charged
 
 logger = logging.getLogger(__name__)
 
@@ -39,8 +42,33 @@ def setup_logging() -> None:
     logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
 
+LOCK_FILE = BASE_DIR / ".bot.lock"
+
+
+def acquire_single_instance() -> "object | None":
+    """
+    Не даёт запустить два экземпляра на одной машине: второй сразу выходит с понятным сообщением.
+    (Конфликт getUpdates между разными машинами ловится в on_error.)
+    """
+    handle = open(LOCK_FILE, "w", encoding="utf-8")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        logger.critical("Уже запущен другой экземпляр бота (файл %s заблокирован). "
+                        "Остановите его: pkill -f 'python bot.py'", LOCK_FILE)
+        raise SystemExit(1)
+    handle.write(str(os.getpid()))
+    handle.flush()
+    return handle
+
+
 async def on_error(event: ErrorEvent) -> bool:
     """Глобальный обработчик ошибок: пишет трассировку в лог и сообщает пользователю."""
+    if isinstance(event.exception, TelegramConflictError):
+        logger.critical("TelegramConflictError: с этим токеном работает второй экземпляр бота. "
+                        "Оставьте один (systemd на сервере) и остановите остальные — иначе часть "
+                        "сообщений теряется.")
+        return True
     logger.error("Необработанная ошибка: %s", event.exception, exc_info=event.exception)
     update = event.update
     try:
@@ -55,6 +83,7 @@ async def on_error(event: ErrorEvent) -> bool:
 
 async def main() -> None:
     setup_logging()
+    lock = acquire_single_instance()
 
     if not BOT_TOKEN:
         logger.critical("Не задан BOT_TOKEN. Скопируйте .env.example в .env и заполните токен.")
@@ -65,6 +94,8 @@ async def main() -> None:
     # Быстрая запись: добавляет bookings.source / bookings.token, если их ещё нет (идемпотентно, до db.connect())
     for step in migrate_bookings(DB_PATH):
         logger.info("Миграция bookings: %s", step)
+    for step in migrate_lessons_charged(DB_PATH):
+        logger.info("Миграция lessons: %s", step)
 
     await db.connect()
 
@@ -115,6 +146,7 @@ async def main() -> None:
         scheduler.shutdown(wait=False)
         await db.close()
         await bot.session.close()
+        lock.close()
         logger.info("Бот остановлен")
 
 

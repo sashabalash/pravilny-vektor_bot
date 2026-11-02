@@ -18,7 +18,7 @@ from keyboards.teacher_menu import (teacher_back_kb, teacher_lesson_status_kb, t
                                     teacher_main_kb, teacher_pick_kb, teacher_student_back_kb)
 from notifications import safe_send
 from stats_text import student_card_text
-from utils import DB_DT_FORMAT, esc, fmt_dt, now_local, safe_edit
+from utils import DB_DT_FORMAT, esc, fmt_balance, fmt_dt, now_local, safe_edit
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +75,7 @@ async def cb_students(callback: CallbackQuery, teacher: dict) -> None:
         blocked = " 🚫" if student["is_blocked"] else ""
         lines.append(
             f"{number}. <b>{esc(student['full_name'])}</b>{blocked} · {esc(student['grade'])} кл. · "
-            f"{esc(student['subject'])} · осталось: {student['balance']} зан.")
+            f"{esc(student['subject'])} · осталось: {fmt_balance(student['balance'])}")
     await safe_edit(callback.message, "\n".join(lines), teacher_back_kb())
 
 
@@ -168,4 +168,4 @@ async def cb_lesson_status(callback: CallbackQuery, bot: Bot, teacher: dict) -> 
         student = await db.get_user_by_id(lesson["student_id"])
         if student:
             await safe_send(bot, student["telegram_id"],
-                            f"✅ Занятие {fmt_dt(lesson['lesson_dt'])} проведено. Осталось занятий: {student['balance']}")
+                            f"✅ Занятие {fmt_dt(lesson['lesson_dt'])} проведено. Осталось занятий: {fmt_balance(student['balance'])}")

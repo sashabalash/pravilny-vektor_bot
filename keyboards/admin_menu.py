@@ -1,26 +1,30 @@
 """
 Клавиатуры админ-панели (только Inline).
 """
-from aiogram.types import InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from utils import fmt_dt, short
 
 
-def admin_main_kb() -> InlineKeyboardMarkup:
+def admin_main_kb(students: int | None = None, new_bookings: int | None = None) -> InlineKeyboardMarkup:
+    """Меню админ-панели. Счётчики в подписях показываются, только если переданы."""
+    students_label = "👥 Ученики" + (f" · {students}" if students is not None else "")
+    bookings_label = "📝 Заявки" + (f" · {new_bookings}" if new_bookings else "")
     builder = InlineKeyboardBuilder()
-    builder.button(text="👥 Ученики", callback_data="adm:students")
+    builder.button(text=students_label, callback_data="adm:students")
     builder.button(text="👨‍🏫 Преподаватели", callback_data="adm:teachers")
     builder.button(text="📅 Расписание", callback_data="adm:schedule")
     builder.button(text="📚 Домашние задания", callback_data="adm:hw")
+    builder.button(text="📅 Сегодня", callback_data="adm:today")
     builder.button(text="📊 Статистика", callback_data="adm:stats")
     builder.button(text="💳 Оплата", callback_data="adm:pay")
-    builder.button(text="📝 Заявки", callback_data="adm:bk")
+    builder.button(text=bookings_label, callback_data="adm:bk")
     builder.button(text="📢 Рассылка", callback_data="adm:bc")
     builder.button(text="❓ FAQ", callback_data="adm:faq")
     builder.button(text="📎 Материалы", callback_data="adm:mat")
     builder.button(text="🏠 Главное меню", callback_data="menu:main")
-    builder.adjust(2, 2, 2, 2, 2)
+    builder.adjust(2, 2, 2, 2, 2, 2)
     return builder.as_markup()
 
 def back_admin_kb() -> InlineKeyboardMarkup:
@@ -35,33 +39,120 @@ def cancel_admin_kb() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def students_list_kb(users: list[dict]) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    for user in users:
-        icon = "🎓" if user["role"] == "student" else "👪"
-        blocked = " 🚫" if user["is_blocked"] else ""
-        builder.button(text=f"{icon} {short(user['full_name'], 35)}{blocked}", callback_data=f"adm:u:{user['id']}")
-    builder.button(text="⬅️ В админ-панель", callback_data="adm:main")
-    builder.adjust(1)
-    return builder.as_markup()
+STUDENTS_PER_PAGE = 9  # 3 кнопки в ряд × 3 ряда на страницу
+
+
+def _user_icon(user: dict) -> str:
+    """Иконка роли; заблокированный пользователь помечается красным флажком."""
+    if user.get("is_blocked"):
+        return "🚫"
+    return "🎓" if user["role"] == "student" else "👪"
+
+
+def student_button_label(user: dict, limit: int = 12) -> str:
+    """«Гримович Маргарита» → «Гримович М.» — короткая подпись под плитку 3 в ряд."""
+    parts = str(user.get("full_name") or "").split()
+    if len(parts) >= 2:
+        label = f"{parts[0]} {parts[1][0]}."
+    else:
+        label = parts[0] if parts else "—"
+    return short(label, limit)
+
+
+def students_list_kb(users: list[dict], page: int = 0, pages: int = 1,
+                     role_filter: str = "all", counts: dict | None = None) -> InlineKeyboardMarkup:
+    """Список учеников: плитка по 3 в ряд, фильтры по роли и постраничная навигация."""
+    counts = counts or {}
+    kb = InlineKeyboardBuilder()
+
+    def tab(key: str, label: str) -> InlineKeyboardButton:
+        mark = "▸ " if key == role_filter else ""
+        return InlineKeyboardButton(text=f"{mark}{label}", callback_data=f"adm:students:{key}:0")
+
+    kb.row(
+        tab("all", f"Все · {counts.get('all', 0)}"),
+        tab("student", f"🎓 {counts.get('student', 0)}"),
+        tab("parent", f"👪 {counts.get('parent', 0)}"),
+    )
+    kb.row(
+        InlineKeyboardButton(text="🔍 Поиск", callback_data="adm:find"),
+        InlineKeyboardButton(text=f"⚠️ С долгом · {counts.get('debt', 0)}",
+                             callback_data="adm:students:debt:0"),
+    )
+    for i in range(0, len(users), 3):
+        row = [
+            InlineKeyboardButton(
+                text=f"{_user_icon(user)} {student_button_label(user)}",
+                callback_data=f"adm:u:{user['id']}",
+            )
+            for user in users[i:i + 3]
+        ]
+        kb.row(*row)
+
+    if pages > 1:
+        prev_page = max(0, page - 1)
+        next_page = min(pages - 1, page + 1)
+        kb.row(
+            InlineKeyboardButton(text="◀️", callback_data=f"adm:students:{role_filter}:{prev_page}"),
+            InlineKeyboardButton(text=f"{page + 1} / {pages}",
+                                 callback_data=f"adm:students:{role_filter}:{page}"),
+            InlineKeyboardButton(text="▶️", callback_data=f"adm:students:{role_filter}:{next_page}"),
+        )
+
+    kb.row(InlineKeyboardButton(text="🔄 Обновить",
+                                callback_data=f"adm:students:{role_filter}:{page}"))
+    kb.row(InlineKeyboardButton(text="⬅️ В админ-панель", callback_data="adm:main"))
+    return kb.as_markup()
 
 
 def user_card_kb(user: dict) -> InlineKeyboardMarkup:
+    """Карточка пользователя: статистика сверху, действия по 2 в ряд."""
     uid = user["id"]
-    builder = InlineKeyboardBuilder()
+    kb = InlineKeyboardBuilder()
     if user["role"] == "student":
-        builder.button(text="➕ Занятие", callback_data=f"adm:ulesson:{uid}")
-        builder.button(text="📚 Выдать ДЗ", callback_data=f"adm:uhw:{uid}")
-        builder.button(text="💳 Принять оплату", callback_data=f"adm:upay:{uid}")
-        builder.button(text="💬 Комментарий к отчёту", callback_data=f"adm:ucomment:{uid}")
-        builder.button(text="👨‍🏫 Преподаватель", callback_data=f"adm:uteacher:{uid}")
-    builder.button(text="✏️ Изменить данные", callback_data=f"adm:uedit:{uid}")
+        kb.row(InlineKeyboardButton(text="📊 Статистика ученика", callback_data=f"adm:ustats:{uid}"))
+        kb.row(
+            InlineKeyboardButton(text="➕ Занятие", callback_data=f"adm:ulesson:{uid}"),
+            InlineKeyboardButton(text="📚 Выдать ДЗ", callback_data=f"adm:uhw:{uid}"),
+        )
+        kb.row(
+            InlineKeyboardButton(text="💳 Принять оплату", callback_data=f"adm:upay:{uid}"),
+            InlineKeyboardButton(text="💬 Комментарий", callback_data=f"adm:ucomment:{uid}"),
+        )
+        kb.row(InlineKeyboardButton(text="👨‍🏫 Преподаватель", callback_data=f"adm:uteacher:{uid}"))
     block_text = "✅ Разблокировать" if user["is_blocked"] else "🚫 Заблокировать"
-    builder.button(text=block_text, callback_data=f"adm:ublock:{uid}")
-    builder.button(text="🗑 Удалить", callback_data=f"adm:udel:{uid}")
-    builder.button(text="⬅️ К списку", callback_data="adm:students")
-    builder.adjust(2, 2, 2, 1, 1, 1)
-    return builder.as_markup()
+    kb.row(
+        InlineKeyboardButton(text="✏️ Изменить данные", callback_data=f"adm:uedit:{uid}"),
+        InlineKeyboardButton(text=block_text, callback_data=f"adm:ublock:{uid}"),
+    )
+    kb.row(InlineKeyboardButton(text="🗑 Удалить", callback_data=f"adm:udel:{uid}"))
+    kb.row(InlineKeyboardButton(text="⬅️ К списку", callback_data="adm:students"))
+    return kb.as_markup()
+
+
+def student_stats_kb(user_id: int) -> InlineKeyboardMarkup:
+    """Кнопки экрана статистики ученика."""
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="🔄 Обновить", callback_data=f"adm:ustats:{user_id}"))
+    kb.row(
+        InlineKeyboardButton(text="📅 Занятия", callback_data=f"adm:uless:{user_id}"),
+        InlineKeyboardButton(text="💳 Оплаты", callback_data=f"adm:upays:{user_id}"),
+    )
+    kb.row(InlineKeyboardButton(text="💳 Принять оплату / продлить", callback_data=f"adm:upay:{user_id}"))
+    kb.row(InlineKeyboardButton(text="⬅️ К карточке", callback_data=f"adm:u:{user_id}"))
+    return kb.as_markup()
+
+
+def student_lessons_kb(user_id: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="⬅️ К статистике", callback_data=f"adm:ustats:{user_id}"))
+    return kb.as_markup()
+
+
+def student_payments_kb(user_id: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="⬅️ К статистике", callback_data=f"adm:ustats:{user_id}"))
+    return kb.as_markup()
 
 
 def edit_fields_kb(user: dict) -> InlineKeyboardMarkup:
@@ -88,13 +179,16 @@ def confirm_delete_kb(uid: int) -> InlineKeyboardMarkup:
 
 
 def pick_student_kb(students: list[dict], prefix: str) -> InlineKeyboardMarkup:
-    """Выбор ученика; callback_data = '<prefix>:<id>'."""
-    builder = InlineKeyboardBuilder()
-    for student in students:
-        builder.button(text=f"🎓 {short(student['full_name'], 35)}", callback_data=f"{prefix}:{student['id']}")
-    builder.button(text="⬅️ В админ-панель", callback_data="adm:main")
-    builder.adjust(1)
-    return builder.as_markup()
+    """Выбор ученика плиткой по 3 в ряд; callback_data = '<prefix>:<id>'."""
+    kb = InlineKeyboardBuilder()
+    for i in range(0, len(students), 3):
+        kb.row(*[
+            InlineKeyboardButton(text=f"🎓 {student_button_label(student)}",
+                                 callback_data=f"{prefix}:{student['id']}")
+            for student in students[i:i + 3]
+        ])
+    kb.row(InlineKeyboardButton(text="⬅️ В админ-панель", callback_data="adm:main"))
+    return kb.as_markup()
 
 
 def schedule_menu_kb() -> InlineKeyboardMarkup:
@@ -172,12 +266,21 @@ def booking_done_kb(booking_id: int) -> InlineKeyboardMarkup:
 
 
 def bookings_kb(bookings: list[dict]) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
+    """Список заявок: открываем карточку, а не закрываем вслепую."""
+    kb = InlineKeyboardBuilder()
     for item in bookings:
-        builder.button(text=f"✅ №{item['id']} · {short(item['name'], 25)}", callback_data=f"adm:bkdone:{item['id']}")
-    builder.button(text="⬅️ В админ-панель", callback_data="adm:main")
-    builder.adjust(1)
-    return builder.as_markup()
+        kb.row(InlineKeyboardButton(text=f"📄 №{item['id']} · {short(item['name'], 25)}",
+                                    callback_data=f"adm:bkc:{item['id']}"))
+    kb.row(InlineKeyboardButton(text="⬅️ В админ-панель", callback_data="adm:main"))
+    return kb.as_markup()
+
+
+def booking_card_kb(booking_id: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="👤 Создать ученика", callback_data=f"adm:bknew:{booking_id}"))
+    kb.row(InlineKeyboardButton(text="✅ Обработана", callback_data=f"adm:bkdone:{booking_id}"))
+    kb.row(InlineKeyboardButton(text="⬅️ К заявкам", callback_data="adm:bk"))
+    return kb.as_markup()
 
 
 def broadcast_audience_kb() -> InlineKeyboardMarkup:

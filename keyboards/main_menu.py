@@ -43,6 +43,16 @@ def main_menu_kb(role: str, is_admin: bool = False) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def report_kb() -> InlineKeyboardMarkup:
+    """Отчёт родителю: неделя или месяц."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📅 За 7 дней", callback_data="menu:report")
+    builder.button(text="📈 За 30 дней", callback_data="menu:report:30")
+    builder.button(text="⬅️ В меню", callback_data="menu:main")
+    builder.adjust(2, 1)
+    return builder.as_markup()
+
+
 def back_to_menu_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="⬅️ В меню", callback_data="menu:main")

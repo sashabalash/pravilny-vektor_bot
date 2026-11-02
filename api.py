@@ -15,6 +15,7 @@ import secrets
 import sqlite3
 import time
 from collections import defaultdict, deque
+from datetime import datetime, timedelta
 
 import aiohttp_cors
 from aiohttp import web
@@ -159,6 +160,28 @@ async def lead(request: web.Request) -> web.Response:
     if fields:
         return web.json_response({"error": "validation", "fields": fields}, status=422)
 
+    # Дедупликация: если по этому телефону уже есть необработанная заявка с сайта
+    # (моложе 24 часов), возвращаем её же ссылку, а не создаём вторую.
+    since = (datetime.utcnow() - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        existing = await db.find_pending_site_booking_by_phone(phone, since)
+    except Exception:
+        log.exception("POST /lead: не удалось проверить дубли")
+        existing = None
+    if existing and existing.get("token"):
+        log.info("POST /lead: дубль заявки по телефону, отдаём существующую #%s", existing["id"])
+        return web.json_response({
+            "booking_id": existing["id"],
+            "url": f"https://t.me/{BOT_USERNAME}?start=b_{existing['token']}",
+            "reused": True,
+        }, status=200)
+
+    known_client = False
+    try:
+        known_client = (await db.find_user_by_phone(phone)) is not None
+    except Exception:
+        log.exception("POST /lead: не удалось проверить клиента")
+
     booking_id = None
     token = ""
     try:
@@ -180,7 +203,8 @@ async def lead(request: web.Request) -> web.Response:
         return _error(500, "server_error")
 
     url = f"https://t.me/{BOT_USERNAME}?start=b_{token}"
-    return web.json_response({"booking_id": booking_id, "url": url}, status=201)
+    return web.json_response({"booking_id": booking_id, "url": url, "known_client": known_client},
+                             status=201)
 
 
 # --- приложение ------------------------------------------------------------

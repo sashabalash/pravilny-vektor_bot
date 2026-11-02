@@ -45,6 +45,12 @@ BOOKINGS_TOKEN_INDEX_SQL = (
 ALTER_SOURCE_SQL = "ALTER TABLE bookings ADD COLUMN source TEXT NOT NULL DEFAULT 'bot';"
 ALTER_TOKEN_SQL = "ALTER TABLE bookings ADD COLUMN token TEXT;"
 
+# --- lessons.charged: флаг «занятие уже списано с баланса» -------------------
+ALTER_REMINDED_SQL = "ALTER TABLE bookings ADD COLUMN reminded INTEGER NOT NULL DEFAULT 0;"
+
+LESSONS_CHARGED_ALTER_SQL = "ALTER TABLE lessons ADD COLUMN charged INTEGER NOT NULL DEFAULT 0;"
+LESSONS_CHARGED_BACKFILL_SQL = "UPDATE lessons SET charged = 1 WHERE status = 'done' AND charged = 0;"
+
 
 def migrate_bookings(db_path: str) -> list[str]:
     """Добавляет bookings.source / bookings.token и уникальный индекс. Возвращает выполненные шаги.
@@ -65,12 +71,43 @@ def migrate_bookings(db_path: str) -> list[str]:
         if "token" not in cols:
             con.execute(ALTER_TOKEN_SQL)
             done.append("ADD COLUMN token")
+        if "reminded" not in cols:
+            con.execute(ALTER_REMINDED_SQL)
+            done.append("ADD COLUMN reminded")
         if done:
             # индекс — строго ПОСЛЕ добавления колонки
             con.execute(BOOKINGS_TOKEN_INDEX_SQL)
             done.append("CREATE UNIQUE INDEX idx_bookings_token")
         else:
             con.execute(BOOKINGS_TOKEN_INDEX_SQL)  # IF NOT EXISTS — ничего не меняет, если индекс уже есть
+        con.commit()
+    finally:
+        con.close()
+    return done
+
+
+def migrate_lessons_charged(db_path: str) -> list[str]:
+    """
+    Добавляет lessons.charged и помечает уже проведённые занятия как списанные.
+
+    Нужна, чтобы «✅ Проведено» не списывало занятие дважды: старая логика уменьшала баланс
+    при каждом нажатии. Повторный запуск безопасен: колонка добавляется один раз,
+    backfill трогает только строки done с charged = 0.
+    """
+    if not os.path.exists(db_path):
+        return []
+    done: list[str] = []
+    con = sqlite3.connect(db_path, timeout=10)
+    try:
+        cols = {row[1] for row in con.execute("PRAGMA table_info(lessons)")}
+        if not cols:
+            return []
+        if "charged" not in cols:
+            con.execute(LESSONS_CHARGED_ALTER_SQL)
+            done.append("ADD COLUMN lessons.charged")
+        cur = con.execute(LESSONS_CHARGED_BACKFILL_SQL)
+        if cur.rowcount:
+            done.append(f"backfill: {cur.rowcount} проведённых занятий помечены как списанные")
         con.commit()
     finally:
         con.close()
@@ -84,7 +121,7 @@ if __name__ == "__main__":
     backup = f"{path}.bak-{datetime.now():%Y%m%d%H%M%S}"
     shutil.copy2(path, backup)
     print(f"Резервная копия: {backup}")
-    steps = migrate_bookings(path)
+    steps = migrate_bookings(path) + migrate_lessons_charged(path)
     print("Выполнено:" if steps else "Уже актуально, менять нечего.")
     for step in steps:
         print(" -", step)

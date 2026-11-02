@@ -9,7 +9,7 @@ from aiogram.types import CallbackQuery, Message
 from config import PAYMENT_REMIND_DAYS, PAYMENT_URL
 from database import db
 from keyboards.main_menu import pay_kb
-from utils import esc, fmt_date, now_local
+from utils import fmt_balance, esc, fmt_date, now_local
 
 router = Router(name="payment")
 
@@ -27,7 +27,7 @@ async def show_balance(target: Message, db_user: dict | None) -> None:
 
     lines = [
         f"💳 <b>Баланс занятий: {esc(student['full_name'])}</b>\n",
-        f"📚 Осталось занятий: <b>{student['balance']}</b>",
+        f"📚 Осталось занятий: <b>{fmt_balance(student['balance'])}</b>",
         f"📆 Пакет действует до: <b>{fmt_date(student['package_end'])}</b>",
     ]
     if student["package_end"]:
@@ -36,6 +36,8 @@ async def show_balance(target: Message, db_user: dict | None) -> None:
             lines.append("\n⚠️ Срок действия пакета истёк. Пожалуйста, продлите оплату.")
         elif days_left <= PAYMENT_REMIND_DAYS:
             lines.append(f"\n⏰ До окончания пакета осталось дней: {days_left}. Самое время продлить!")
+    elif student["balance"] < 0:
+        lines.append(f"\n⚠️ Задолженность: {abs(student['balance'])} зан. Пожалуйста, продлите оплату.")
     elif student["balance"] == 0:
         lines.append("\nℹ️ Оплаченных занятий пока нет.")
 

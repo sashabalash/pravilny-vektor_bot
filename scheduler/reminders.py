@@ -2,7 +2,9 @@
 Планировщик APScheduler:
   • каждую минуту — напоминания о занятиях (за 1 час и за 10 минут);
   • ежедневно в 09:00 — напоминания об оплате (за 3 дня до окончания пакета);
-  • по понедельникам в 10:00 — отчёты родителям.
+  • по понедельникам в 10:00 — отчёты родителям;
+  • ежедневно в 03:10 — резервная копия базы (backups/, хранится 14 дней);
+  • каждый час — напоминание админам о заявках с сайта, висящих больше 24 часов.
 Флаги отправки хранятся в БД, поэтому напоминания не дублируются после перезапуска.
 """
 import logging
@@ -12,12 +14,13 @@ from aiogram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from config import NOTIFY_PAYMENTS, PAYMENT_REMIND_DAYS, PAYMENT_URL, TIMEZONE
+from backup import daily_backup_job
+from config import ADMIN_IDS, NOTIFY_PAYMENTS, PAYMENT_REMIND_DAYS, PAYMENT_URL, TIMEZONE
 from database import db
 from handlers.reports import send_weekly_reports
 from keyboards.main_menu import pay_kb
-from notifications import notify_family
-from utils import DB_DT_FORMAT, esc, fmt_date, fmt_dt, now_local
+from notifications import notify_family, safe_send
+from utils import DB_DT_FORMAT, esc, fmt_balance, fmt_date, fmt_dt, now_local
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +75,7 @@ async def check_payment_reminders(bot: Bot) -> None:
             text = (
                 "💳 <b>Напоминание об оплате</b>\n\n"
                 f"Пакет занятий действует до <b>{fmt_date(student['package_end'])}</b>. "
-                f"Осталось занятий: {student['balance']}.\n"
+                f"Осталось занятий: {fmt_balance(student['balance'])}.\n"
                 "Чтобы не прерывать подготовку, продлите оплату заранее 🙌"
             )
             parent_text = f"👤 Ученик: {esc(student['full_name'])}\n\n{text}"
@@ -90,6 +93,29 @@ async def weekly_reports_job(bot: Bot) -> None:
         logger.exception("Ошибка при отправке еженедельных отчётов")
 
 
+async def check_stale_bookings(bot: Bot) -> None:
+    """Заявки с сайта, которые висят больше суток: одно сводное напоминание админам."""
+    try:
+        stale = await db.stale_site_bookings(24)
+        if not stale:
+            return
+        lines = [f"⏳ <b>Заявок с сайта без ответа: {len(stale)}</b> (старше 24 часов)", ""]
+        for booking in stale[:10]:
+            lines.append(f"• №{booking['id']} · {esc(booking['name'])} · {esc(booking['phone'])}")
+        if len(stale) > 10:
+            lines.append(f"…и ещё {len(stale) - 10}")
+        lines.append("")
+        lines.append("Откройте «📝 Заявки» в админ-панели, чтобы обработать.")
+        text = "\n".join(lines)
+        for admin_id in ADMIN_IDS:
+            await safe_send(bot, admin_id, text)
+        for booking in stale:
+            await db.mark_booking_reminded(booking["id"])
+        logger.info("Сводное напоминание по %s заявкам отправлено", len(stale))
+    except Exception:
+        logger.exception("Не удалось отправить напоминания по заявкам")
+
+
 def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
     """Создаёт планировщик и регистрирует задачи (запуск — scheduler.start())."""
     scheduler = AsyncIOScheduler(timezone=TIMEZONE)
@@ -103,4 +129,10 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
     scheduler.add_job(
         weekly_reports_job, CronTrigger(day_of_week="mon", hour=10, minute=0, timezone=TIMEZONE), args=[bot],
         id="weekly_reports", max_instances=1, coalesce=True)
+    scheduler.add_job(
+        daily_backup_job, CronTrigger(hour=3, minute=10, timezone=TIMEZONE),
+        id="daily_backup", max_instances=1, coalesce=True)
+    scheduler.add_job(
+        check_stale_bookings, "interval", hours=1, args=[bot],
+        id="stale_bookings", max_instances=1, coalesce=True)
     return scheduler

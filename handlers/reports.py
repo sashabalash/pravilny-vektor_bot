@@ -11,7 +11,7 @@ from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
 
 from database import db
-from keyboards.main_menu import back_to_menu_kb
+from keyboards.main_menu import back_to_menu_kb, report_kb
 from notifications import safe_send
 from utils import esc, now_local
 
@@ -69,7 +69,7 @@ async def send_weekly_reports(bot: Bot) -> None:
     logger.info("Еженедельные отчёты отправлены: %s сообщений", sent)
 
 
-async def show_report(target: Message, db_user: dict | None) -> None:
+async def show_report(target: Message, db_user: dict | None, days: int = 7) -> None:
     """Отчёт за последние 7 дней по запросу."""
     if not db_user:
         await target.answer("Сначала зарегистрируйтесь: /start")
@@ -81,8 +81,8 @@ async def show_report(target: Message, db_user: dict | None) -> None:
             reply_markup=back_to_menu_kb())
         return
     today = now_local().date()
-    report = await build_report(student, today - timedelta(days=6), today)
-    await target.answer(format_report(student, report), reply_markup=back_to_menu_kb())
+    report = await build_report(student, today - timedelta(days=days - 1), today)
+    await target.answer(format_report(student, report), reply_markup=report_kb())
 
 
 @router.message(Command("report"))
@@ -93,4 +93,10 @@ async def cmd_report(message: Message, db_user: dict | None) -> None:
 @router.callback_query(F.data == "menu:report")
 async def cb_report(callback: CallbackQuery, db_user: dict | None) -> None:
     await callback.answer()
-    await show_report(callback.message, db_user)
+    await show_report(callback.message, db_user, days=7)
+
+
+@router.callback_query(F.data == "menu:report:30")
+async def cb_report_month(callback: CallbackQuery, db_user: dict | None) -> None:
+    await callback.answer()
+    await show_report(callback.message, db_user, days=30)

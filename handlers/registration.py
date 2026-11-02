@@ -13,7 +13,7 @@ from config import is_admin
 from database import db
 from handlers.start import show_main_menu
 from keyboards.main_menu import back_to_menu_kb
-from utils import esc
+from utils import validate_phone, esc
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +118,24 @@ async def _finish(message: Message, state: FSMContext) -> None:
     role = data["role"]
     telegram_id = message.from_user.id
     username = message.from_user.username
+
+    # Если ученика уже завели из заявки с сайта (telegram_id < 0) — привязываем аккаунт к нему
+    try:
+        phone_for_match = validate_phone(data["phone"]) or data["phone"]
+        placeholder = await db.attach_telegram_by_phone(phone_for_match, telegram_id, username)
+    except Exception:
+        logger.exception("Не удалось привязать аккаунт к заявке")
+        placeholder = None
+    if placeholder:
+        fields = {"full_name": data["full_name"], "phone": phone_for_match}
+        if data.get("grade"):
+            fields["grade"] = data["grade"]
+        if data.get("child_name"):
+            fields["child_name"] = data["child_name"]
+        await db.update_user(placeholder["id"], **fields)
+        await show_main_menu(message, await db.get_user_by_id(placeholder["id"]), is_admin(telegram_id),
+                             "✅ Аккаунт привязан к заявке с сайта — данные сохранены.")
+        return
 
     try:
         user_id = await db.add_user(

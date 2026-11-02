@@ -8,3 +8,10 @@ venv/
 *.zip
 *.save
 *.broken
+
+backups/
+.bot.lock
+.backup-*/
+logs/
+*.db-wal
+*.db-shm

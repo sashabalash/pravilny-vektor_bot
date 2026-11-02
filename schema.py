@@ -6,7 +6,8 @@
   • таблица teachers (преподаватели);
   • users.teacher_id и lessons.teacher_id — привязка ученика и занятия к преподавателю;
   • роль 'admin' в users;
-  • bookings.subject (предмет из заявки), payments.status (статус оплаты).
+  • bookings.subject (предмет из заявки), payments.status (статус оплаты);
+  • lessons.charged — занятие уже списано с баланса (защита от двойного списания).
 """
 
 SCHEMA_VERSION = 2
@@ -63,6 +64,7 @@ CREATE TABLE IF NOT EXISTS lessons (
     link TEXT,
     topic TEXT,
     status TEXT NOT NULL DEFAULT 'scheduled',
+    charged INTEGER NOT NULL DEFAULT 0,
     reminded_1h INTEGER NOT NULL DEFAULT 0,
     reminded_10m INTEGER NOT NULL DEFAULT 0
 );

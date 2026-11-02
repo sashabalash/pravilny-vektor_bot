@@ -41,6 +41,15 @@ def now_ts() -> str:
     return now_local().strftime(DB_TS_FORMAT)
 
 
+def fmt_balance(value) -> str:
+    """5 → «5 зан.», −1 → «долг 1 зан.» (отрицательный баланс — долг ученика)."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = 0
+    return f"долг {abs(number)} зан." if number < 0 else f"{number} зан."
+
+
 def normalize_name(name) -> str:
     """Приводит имя к виду для сравнения (регистр, ё/е, пробелы)."""
     return " ".join(str(name or "").casefold().replace("ё", "е").split())

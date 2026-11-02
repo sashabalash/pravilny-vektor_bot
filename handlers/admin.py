@@ -5,7 +5,7 @@
 """
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError
@@ -19,14 +19,15 @@ from config import (ADMIN_IDS, DEFAULT_PACKAGE_DAYS, HW_SCORES, HW_STATUS_LABELS
 from database import db
 from handlers.homework import send_submission_to_admin
 from keyboards.admin_menu import (
-    admin_main_kb, back_admin_kb, bookings_kb, broadcast_audience_kb,
+    admin_main_kb, back_admin_kb, booking_card_kb, bookings_kb, broadcast_audience_kb,
     broadcast_confirm_kb, broadcast_select_kb, cancel_admin_kb, confirm_delete_kb, edit_fields_kb,
     faq_admin_kb, hw_menu_kb, lesson_status_kb, lessons_list_kb, pick_student_kb, pick_teacher_kb, review_comment_kb,
-    material_card_kb, materials_admin_kb, schedule_menu_kb, students_list_kb, submissions_list_kb, teacher_card_kb, teachers_list_kb,
-    user_card_kb)
+    material_card_kb, materials_admin_kb, STUDENTS_PER_PAGE, schedule_menu_kb, student_lessons_kb,
+    student_payments_kb, student_stats_kb, students_list_kb, submissions_list_kb, teacher_card_kb,
+    teachers_list_kb, user_card_kb)
 from keyboards.main_menu import homework_notify_kb
 from notifications import notify_family, safe_send
-from utils import (DB_DT_FORMAT, esc, fmt_date, fmt_dt, now_local, parse_date, parse_time, safe_edit,
+from utils import (DB_DT_FORMAT, esc, fmt_balance, fmt_date, fmt_dt, now_local, parse_date, parse_time, safe_edit,
                    validate_amount, validate_grade, validate_int, validate_name, validate_phone,
                    validate_url)
 
@@ -68,6 +69,8 @@ class AdminStates(StatesGroup):
     faq_answer = State()
     mat_title = State()
     mat_file = State()
+    student_search = State()
+    confirm_delete = State()
 
 
 # ======================================================================
@@ -80,21 +83,42 @@ async def cmd_admin(message: Message, state: FSMContext, is_admin: bool) -> None
         await message.answer("⛔ Эта команда доступна только администраторам.")
         return
     await state.clear()
-    await message.answer(PANEL_TEXT, reply_markup=admin_main_kb())
+    stats = await db.get_stats()
+    await message.answer(PANEL_TEXT,
+                         reply_markup=admin_main_kb(students=stats["students"],
+                                                    new_bookings=stats["bookings_new"]))
 
 
 @admin_router.callback_query(F.data == "adm:main")
 async def cb_admin_main(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     await state.clear()
-    await safe_edit(callback.message, PANEL_TEXT, admin_main_kb())
+    stats = await db.get_stats()
+    await safe_edit(callback.message, PANEL_TEXT,
+                    admin_main_kb(students=stats["students"], new_bookings=stats["bookings_new"]))
 
 
 # ======================================================================
 # Ученики и родители
 # ======================================================================
 
-def user_card_text(user: dict) -> str:
+LESSON_STATUS_RU = {
+    "scheduled": "запланировано",
+    "done": "проведено",
+    "missed": "пропущено",
+    "cancelled": "отменено",
+}
+
+
+def fmt_lesson_dt(db_value: str) -> str:
+    """'2026-11-03 18:00' → 'Пн, 03.11.2026 в 18:00' (без падения на нестандартном формате)."""
+    try:
+        return fmt_dt(db_value)
+    except (ValueError, TypeError):
+        return str(db_value)
+
+
+def user_card_text(user: dict, stats: dict | None = None) -> str:
     role = "🎓 Ученик" if user["role"] == "student" else "👪 Родитель"
     lines = [f"<b>{esc(user['full_name'])}</b> — {role}", f"📱 {esc(user['phone'])}"]
     if user["username"]:
@@ -102,12 +126,24 @@ def user_card_text(user: dict) -> str:
     lines.append(f"🔗 <a href=\"tg://user?id={user['telegram_id']}\">Открыть чат</a>")
     if user["role"] == "student":
         lines.append(f"🏫 Класс: {esc(user['grade'])} · 📖 {esc(user['subject'])}")
-        lines.append(f"💳 Баланс: {user['balance']} зан. · пакет до {fmt_date(user['package_end'])}")
+        lines.append(f"💳 Баланс: {fmt_balance(user['balance'])} · пакет до {fmt_date(user['package_end'])}")
         if user["report_comment"]:
             lines.append(f"💬 Комментарий к отчёту: {esc(user['report_comment'])}")
+        if stats:
+            lessons = stats["lessons"]
+            done = lessons.get("done", 0)
+            planned = lessons.get("scheduled", 0)
+            tail = f" · {planned} впереди" if planned else ""
+            lines.append(f"📅 Занятия: {done} проведено{tail}")
+            hw_line = f"📚 ДЗ: {stats['hw_submitted']}/{stats['hw_total']} сдано"
+            if stats["avg_score"] is not None:
+                hw_line += f" · ср. балл {stats['avg_score']:.1f}"
+            lines.append(hw_line)
+            if stats["next_lesson"]:
+                lines.append(f"🕒 Ближайшее: {fmt_lesson_dt(stats['next_lesson']['lesson_dt'])}")
     else:
         lines.append(f"👶 Ребёнок: {esc(user['child_name'])}")
-    lines.append(f"📅 Регистрация: {user['created_at'][:10]}")
+    lines.append(f"🗓 Регистрация: {user['created_at'][:10]}")
     lines.append("🚫 <b>Заблокирован</b>" if user["is_blocked"] else "🟢 Активен")
     return "\n".join(lines)
 
@@ -117,20 +153,228 @@ async def show_user_card(target: Message, user_id: int, edit: bool = False) -> N
     if not user:
         await target.answer("Пользователь не найден.", reply_markup=back_admin_kb())
         return
+    stats = await db.get_student_dashboard(user["id"]) if user["role"] == "student" else None
+    text = user_card_text(user, stats)
     if edit:
-        await safe_edit(target, user_card_text(user), user_card_kb(user))
+        await safe_edit(target, text, user_card_kb(user))
     else:
-        await target.answer(user_card_text(user), reply_markup=user_card_kb(user))
+        await target.answer(text, reply_markup=user_card_kb(user))
+
+
+TITLES_BY_FILTER = {"all": "Ученики и родители", "student": "Ученики", "parent": "Родители",
+                    "debt": "С долгом по занятиям", "find": "Результаты поиска"}
+
+
+async def render_students(callback: CallbackQuery, role_filter: str, page: int,
+                          query: str = "") -> None:
+    """Список учеников: 3 в ряд, по 9 на страницу, фильтры по роли, долгу и поиск."""
+    debt_total = (await db.search_users("", None, 0, 1, debt_only=True))[1]
+    counts = {
+        "all": await db.count_users(),
+        "student": await db.count_users("student"),
+        "parent": await db.count_users("parent"),
+        "debt": debt_total,
+    }
+    offset = page * STUDENTS_PER_PAGE
+    if role_filter == "find":
+        users, total = await db.search_users(query, None, offset, STUDENTS_PER_PAGE)
+    elif role_filter == "debt":
+        users, total = await db.search_users("", None, offset, STUDENTS_PER_PAGE, debt_only=True)
+    else:
+        total = counts["all"] if role_filter == "all" else counts[role_filter]
+        users = await db.list_users_page(
+            None if role_filter == "all" else role_filter, offset=offset, limit=STUDENTS_PER_PAGE)
+
+    pages = max(1, (total + STUDENTS_PER_PAGE - 1) // STUDENTS_PER_PAGE)
+    page = max(0, min(page, pages - 1))
+    blocked = await db.count_blocked()
+
+    lines = [f"👥 <b>{TITLES_BY_FILTER[role_filter]}</b>", ""]
+    if role_filter == "find":
+        lines.append(f"🔍 «{esc(query)}» — найдено: <b>{total}</b>")
+    else:
+        summary = f"🎓 Учеников: <b>{counts['student']}</b> · 👪 Родителей: <b>{counts['parent']}</b>"
+        if debt_total:
+            summary += f" · ⚠️ С долгом: <b>{debt_total}</b>"
+        if blocked:
+            summary += f" · 🚫 Заблокировано: <b>{blocked}</b>"
+        lines.append(summary)
+    if users:
+        lines.append(f"Страница {page + 1} из {pages} · нажмите на имя, чтобы открыть карточку")
+    else:
+        lines.append("Ничего не найдено." if role_filter in ("find", "debt") else "Здесь пока пусто.")
+    await safe_edit(callback.message, "\n".join(lines),
+                    students_list_kb(users, page, pages, role_filter, counts))
 
 
 @admin_router.callback_query(F.data == "adm:students")
 async def cb_students(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     await state.clear()
-    users = await db.list_users(limit=50)
-    text = (f"👥 <b>Пользователи</b> (показано: {len(users)})\nВыберите, чтобы открыть карточку:"
-            if users else "Пока никто не зарегистрирован.")
-    await safe_edit(callback.message, text, students_list_kb(users))
+    await render_students(callback, "all", 0)
+
+
+@admin_router.callback_query(F.data.startswith("adm:students:"))
+async def cb_students_page(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.clear()
+    parts = callback.data.split(":")
+    role_filter = parts[2] if len(parts) > 2 and parts[2] in TITLES_BY_FILTER else "all"
+    page = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
+    data = await state.get_data()
+    await render_students(callback, role_filter, page, data.get("search_query", ""))
+
+
+@admin_router.callback_query(F.data == "adm:find")
+async def cb_find_student(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.set_state(AdminStates.student_search)
+    await callback.message.answer(
+        "🔍 Введите имя, фамилию, телефон или @username ученика:\nОтмена: /cancel")
+
+
+@admin_router.message(AdminStates.student_search, *TEXT_ONLY)
+async def msg_find_student(message: Message, state: FSMContext) -> None:
+    query = " ".join(message.text.split())[:60]
+    await state.update_data(search_query=query)
+    await state.set_state(None)  # данные поиска остаются для листания страниц
+    users, total = await db.search_users(query, None, 0, STUDENTS_PER_PAGE)
+    counts = {
+        "all": await db.count_users(),
+        "student": await db.count_users("student"),
+        "parent": await db.count_users("parent"),
+        "debt": (await db.search_users("", None, 0, 1, debt_only=True))[1],
+    }
+    pages = max(1, (total + STUDENTS_PER_PAGE - 1) // STUDENTS_PER_PAGE)
+    text = (f"👥 <b>Результаты поиска</b>\n\n🔍 «{esc(query)}» — найдено: <b>{total}</b>\n"
+            f"Страница 1 из {pages}")
+    if not total:
+        text = f"👥 <b>Результаты поиска</b>\n\n🔍 «{esc(query)}» — ничего не найдено."
+    await message.answer(text, reply_markup=students_list_kb(users, 0, pages, "find", counts))
+
+
+def student_stats_text(user: dict, stats: dict) -> str:
+    """Экран статистики ученика: занятия, ДЗ, оплаты, активность."""
+    lessons = stats["lessons"]
+    done = lessons.get("done", 0)
+    planned = lessons.get("scheduled", 0)
+    missed = lessons.get("missed", 0)
+    cancelled = lessons.get("cancelled", 0)
+
+    meta = []
+    if user["grade"]:
+        meta.append(f"🏫 {esc(user['grade'])} класс")
+    if user["subject"]:
+        meta.append(esc(user["subject"]))
+    meta.append("🚫 заблокирован" if user["is_blocked"] else "🟢 активен")
+
+    lines = [f"📊 <b>Статистика: {esc(user['full_name'])}</b>", " · ".join(meta), ""]
+
+    if user["package_end"] or user["balance"]:
+        lines.append(f"📦 Пакет до {fmt_date(user['package_end'])} · баланс {fmt_balance(user['balance'])}")
+        lines.append("")
+
+    lines.append(f"📅 <b>Занятия</b> — всего {stats['lessons_total']}")
+    lines.append(f"• проведено {done} · запланировано {planned}")
+    if missed or cancelled:
+        lines.append(f"• пропущено {missed} · отменено {cancelled}")
+    if stats["attendance"] is not None:
+        lines.append(f"• посещаемость {stats['attendance']}%")
+    lines.append("")
+
+    lines.append("📚 <b>Домашние задания</b>")
+    lines.append(f"• выдано {stats['hw_total']} · сдано {stats['hw_submitted']} · "
+                 f"не сдано {stats['hw_unsubmitted']}")
+    if stats["hw_pending"]:
+        lines.append(f"• на проверке {stats['hw_pending']}")
+    if stats["avg_score"] is not None:
+        lines.append(f"• средний балл {stats['avg_score']:.1f} / 10")
+    else:
+        lines.append("• средний балл: оценок пока нет")
+    lines.append("")
+
+    lines.append("💳 <b>Оплаты</b>")
+    if stats["payments_count"]:
+        lines.append(f"• {stats['payments_count']} на {stats['payments_sum']:g} BYN")
+        last_payment = stats["last_payment"]
+        if last_payment:
+            lines.append(f"• последняя {fmt_date(str(last_payment['paid_at'])[:10])} · "
+                         f"{last_payment['amount']:g} BYN · {last_payment['lessons_count']} зан.")
+    else:
+        lines.append("• оплат пока не было")
+    lines.append("")
+
+    lines.append("🕒 <b>Активность</b>")
+    if stats["last_lesson"]:
+        lines.append(f"• последний урок: {fmt_lesson_dt(stats['last_lesson']['lesson_dt'])}")
+    if stats["last_submission"]:
+        lines.append(f"• последняя сдача ДЗ: {fmt_date(str(stats['last_submission']['submitted_at'])[:10])}")
+    if stats["next_lesson"]:
+        lines.append(f"• ближайший урок: {fmt_lesson_dt(stats['next_lesson']['lesson_dt'])}")
+    if not (stats["last_lesson"] or stats["last_submission"] or stats["next_lesson"]):
+        lines.append("• активности пока нет")
+    return "\n".join(lines)
+
+
+async def _load_student(callback: CallbackQuery) -> dict | None:
+    user = await db.get_user_by_id(int(callback.data.split(":")[2]))
+    if not user or user["role"] != "student":
+        await callback.answer("Ученик не найден", show_alert=True)
+        return None
+    return user
+
+
+@admin_router.callback_query(F.data.startswith("adm:ustats:"))
+async def cb_user_stats(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.clear()
+    user = await _load_student(callback)
+    if not user:
+        return
+    stats = await db.get_student_dashboard(user["id"])
+    await safe_edit(callback.message, student_stats_text(user, stats), student_stats_kb(user["id"]))
+
+
+@admin_router.callback_query(F.data.startswith("adm:uless:"))
+async def cb_user_lessons(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.clear()
+    user = await _load_student(callback)
+    if not user:
+        return
+    lessons = await db.get_student_lessons(user["id"], limit=8)
+    lines = [f"📅 <b>Занятия: {esc(user['full_name'])}</b>", ""]
+    if lessons:
+        for lesson in lessons:
+            status = LESSON_STATUS_RU.get(lesson["status"], lesson["status"])
+            topic = f" · {esc(lesson['topic'])}" if lesson.get("topic") else ""
+            lines.append(f"• {fmt_lesson_dt(lesson['lesson_dt'])} — {status}{topic}")
+    else:
+        lines.append("Занятий пока не было.")
+    await safe_edit(callback.message, "\n".join(lines), student_lessons_kb(user["id"]))
+
+
+@admin_router.callback_query(F.data.startswith("adm:upays:"))
+async def cb_user_payments(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.clear()
+    user = await _load_student(callback)
+    if not user:
+        return
+    payments = await db.get_student_payments(user["id"], limit=8)
+    lines = [f"💳 <b>Оплаты: {esc(user['full_name'])}</b>", ""]
+    if payments:
+        total = sum(p["amount"] for p in payments if p["status"] == "paid")
+        for payment in payments:
+            mark = "✅" if payment["status"] == "paid" else "⏳"
+            lines.append(f"{mark} {fmt_date(str(payment['paid_at'])[:10])} · "
+                         f"{payment['amount']:g} BYN · {payment['lessons_count']} зан. · "
+                         f"до {fmt_date(payment['valid_until'])}")
+        lines.append("")
+        lines.append(f"Итого: <b>{total:g} BYN</b> · баланс {fmt_balance(user['balance'])}")
+    else:
+        lines.append("Оплат пока не было.")
+    await safe_edit(callback.message, "\n".join(lines), student_payments_kb(user["id"]))
 
 
 @admin_router.callback_query(F.data.startswith("adm:u:"))
@@ -197,16 +441,28 @@ async def msg_edit_value(message: Message, state: FSMContext) -> None:
 
 
 @admin_router.callback_query(F.data.startswith("adm:udel:"))
-async def cb_user_delete(callback: CallbackQuery) -> None:
+async def cb_user_delete(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     user = await db.get_user_by_id(int(callback.data.split(":")[2]))
     if not user:
         return
-    await safe_edit(
-        callback.message,
-        f"🗑 Удалить <b>{esc(user['full_name'])}</b>? Будут удалены занятия, ДЗ и оплаты этого пользователя. "
-        "Действие необратимо.",
-        confirm_delete_kb(user["id"]))
+    await state.set_state(AdminStates.confirm_delete)
+    await state.update_data(user_id=user["id"])
+    await callback.message.answer(
+        f"🗑 Удалить <b>{esc(user['full_name'])}</b>? Вместе с ним удалятся занятия, ДЗ и оплаты.\n\n"
+        "Если нужно просто закрыть доступ — используйте «🚫 Заблокировать».\n"
+        "Для удаления напишите слово <b>УДАЛИТЬ</b>. Отмена: /cancel")
+
+
+@admin_router.message(AdminStates.confirm_delete, *TEXT_ONLY)
+async def msg_confirm_delete(message: Message, state: FSMContext) -> None:
+    if message.text.strip().upper() != "УДАЛИТЬ":
+        await message.answer("Чтобы удалить — напишите <b>УДАЛИТЬ</b>. Отмена: /cancel")
+        return
+    data = await state.get_data()
+    await state.clear()
+    await db.delete_user(data["user_id"])
+    await message.answer("🗑 Пользователь удалён вместе с занятиями, ДЗ и оплатами.", reply_markup=back_admin_kb())
 
 
 @admin_router.callback_query(F.data.startswith("adm:udelok:"))
@@ -320,6 +576,16 @@ async def msg_lesson_link(message: Message, state: FSMContext, bot: Bot) -> None
     if not student:
         await message.answer("Ученик не найден.", reply_markup=back_admin_kb())
         return
+    conflict = await db.has_lesson_conflict(student["id"], data["lesson_dt"], student.get("teacher_id"))
+    if conflict:
+        if conflict["student_id"] == student["id"]:
+            who = f"у ученика <b>{esc(student['full_name'])}</b>"
+        else:
+            who = "у преподавателя"
+        await message.answer(
+            f"⚠️ В это время уже есть занятие {who}: {fmt_dt(conflict['lesson_dt'])}.\n"
+            "Занятие не добавлено — выберите другое время.", reply_markup=schedule_menu_kb())
+        return
     await db.add_lesson(student["id"], data["lesson_dt"], link)
     await message.answer(
         f"✅ Занятие добавлено: <b>{esc(student['full_name'])}</b>, {fmt_dt(data['lesson_dt'])}",
@@ -367,7 +633,7 @@ async def cb_lesson_status(callback: CallbackQuery, bot: Bot) -> None:
         student = await db.get_user_by_id(lesson["student_id"])
         if student:
             await safe_send(bot, student["telegram_id"],
-                            f"✅ Занятие {fmt_dt(lesson['lesson_dt'])} проведено. Осталось занятий: {student['balance']}")
+                            f"✅ Занятие {fmt_dt(lesson['lesson_dt'])} проведено. Осталось занятий: {fmt_balance(student['balance'])}")
 
 
 # ======================================================================
@@ -564,12 +830,47 @@ async def cb_bookings(callback: CallbackQuery) -> None:
     if not bookings:
         await safe_edit(callback.message, "✅ Новых заявок нет.", back_admin_kb())
         return
-    lines = ["📝 <b>Новые заявки</b> (нажмите кнопку, чтобы отметить обработанной):\n"]
+    lines = ["📝 <b>Новые заявки</b> — откройте карточку, чтобы создать ученика:\n"]
     for item in bookings:
         lines.append(
             f"<b>№{item['id']}</b> · {esc(item['name'])} · {esc(item['phone'])}\n"
             f"   {esc(item['lesson_format'])} · {esc(item['goal'])} · {item['created_at'][:16]}")
     await safe_edit(callback.message, "\n".join(lines), bookings_kb(bookings))
+
+
+@admin_router.callback_query(F.data.startswith("adm:bkc:"))
+async def cb_booking_card(callback: CallbackQuery) -> None:
+    await callback.answer()
+    booking = await db.get_booking(int(callback.data.split(":")[2]))
+    if not booking:
+        await safe_edit(callback.message, "Заявка не найдена.", back_admin_kb())
+        return
+    source = "сайт" if booking.get("source") == "site" else "бот"
+    text = (f"📄 <b>Заявка №{booking['id']}</b>\n\n"
+            f"👤 {esc(booking['name'])}\n"
+            f"📱 {esc(booking['phone'])}\n"
+            f"🎯 {esc(booking['lesson_format'])} · {esc(booking['goal'])}\n"
+            f"📅 {booking['created_at'][:16]} · источник: {source}\n\n"
+            "Можно сразу создать ученика — данные перенесутся в карточку.")
+    await safe_edit(callback.message, text, booking_card_kb(booking["id"]))
+
+
+@admin_router.callback_query(F.data.startswith("adm:bknew:"))
+async def cb_booking_new_user(callback: CallbackQuery) -> None:
+    booking_id = int(callback.data.split(":")[2])
+    user = await db.create_user_from_booking(booking_id)
+    if not user:
+        await callback.answer("Не удалось создать ученика", show_alert=True)
+        return
+    await callback.answer("👤 Ученик создан")
+    text = (f"👤 <b>{esc(user['full_name'])}</b> добавлен(а) в ученики.\n"
+            f"📱 {esc(user['phone'])} · {esc(user['subject'] or 'предмет уточним')}\n\n"
+            "Когда человек откроет бота и зарегистрируется с этим же номером, "
+            "аккаунт привяжется автоматически — история и оплаты сохранятся.")
+    if user["telegram_id"] and user["telegram_id"] > 0:
+        text = (f"ℹ️ По этому телефону уже есть пользователь: <b>{esc(user['full_name'])}</b>. "
+                "Заявка отмечена обработанной.")
+    await safe_edit(callback.message, text, back_admin_kb())
 
 
 @admin_router.callback_query(F.data.startswith("adm:bkdone:"))
@@ -690,6 +991,33 @@ def _month_label(year_month: str) -> str:
     """'2026-10' -> 'октябрь 2026'."""
     year, month = year_month.split("-")
     return f"{MONTHS_RU[int(month) - 1]} {year}"
+
+
+@admin_router.callback_query(F.data == "adm:today")
+async def cb_today(callback: CallbackQuery) -> None:
+    await callback.answer()
+    today = now_local().date()
+    start = f"{today.isoformat()} 00:00"
+    end = f"{(today + timedelta(days=1)).isoformat()} 00:00"
+    lessons = await db.lessons_between(start, end)
+    bookings = await db.list_bookings("new", 50)
+    submissions = await db.list_pending_submissions(50)
+    ending = await db.packages_ending((today + timedelta(days=7)).isoformat())
+
+    lines = [f"📅 <b>Сводка на {today:%d.%m.%Y}</b>", ""]
+    lines.append(f"🗓 Занятий сегодня: <b>{len(lessons)}</b>")
+    for lesson in lessons[:6]:
+        status = LESSON_STATUS_RU.get(lesson["status"], lesson["status"])
+        lines.append(f"• {lesson['lesson_dt'][11:16]} — {esc(lesson['student_name'])} ({status})")
+    if len(lessons) > 6:
+        lines.append(f"…и ещё {len(lessons) - 6}")
+    lines.append("")
+    lines.append(f"📝 Новых заявок: <b>{len(bookings)}</b>")
+    lines.append(f"📚 ДЗ на проверке: <b>{len(submissions)}</b>")
+    lines.append(f"💳 Пакет заканчивается в ближайшие 7 дней: <b>{len(ending)}</b>")
+    for student in ending[:4]:
+        lines.append(f"• {esc(student['full_name'])} — до {fmt_date(student['package_end'])}")
+    await safe_edit(callback.message, "\n".join(lines), back_admin_kb())
 
 
 @admin_router.callback_query(F.data == "adm:stats")
@@ -996,11 +1324,11 @@ async def cb_teacher_stats(callback: CallbackQuery) -> None:
     t = await db.get_teacher(teacher_id)
     text = (
         f"📊 <b>Статистика: {esc(t['name'] if t else '—')}</b>\n\n"
-        f"👥 Учеников: {stats['students_count']}\n"
+        f"👥 Учеников: {stats['students']}\n"
         f"✅ Проведено занятий: {stats['lessons_done']}\n"
-        f"📅 Запланировано: {stats['lessons_scheduled']}\n"
-        f"💳 Оплачено всего: {stats['money_total']} BYN\n"
-        f"💳 За текущий месяц: {stats['money_month']} BYN"
+        f"📅 Запланировано: {stats['lessons_planned']}\n"
+        f"💳 Оплачено всего: {stats['money_total']:g} BYN\n"
+        f"💳 За текущий месяц: {stats['money_month']:g} BYN"
     )
     await safe_edit(callback.message, text, teacher_card_kb(teacher_id))
 
