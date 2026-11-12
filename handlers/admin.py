@@ -586,7 +586,7 @@ async def msg_lesson_link(message: Message, state: FSMContext, bot: Bot) -> None
             f"⚠️ В это время уже есть занятие {who}: {fmt_dt(conflict['lesson_dt'])}.\n"
             "Занятие не добавлено — выберите другое время.", reply_markup=schedule_menu_kb())
         return
-    await db.add_lesson(student["id"], data["lesson_dt"], link)
+    await db.add_lesson(student["id"], data["lesson_dt"], link, teacher_id=student.get("teacher_id"))
     await message.answer(
         f"✅ Занятие добавлено: <b>{esc(student['full_name'])}</b>, {fmt_dt(data['lesson_dt'])}",
         reply_markup=schedule_menu_kb())

@@ -20,7 +20,7 @@ from api import start_api
 from config import ADMIN_IDS, BASE_DIR, BOT_TOKEN, DB_PATH, LOG_FILE
 from database import db
 from handlers import (admin, booking, faq, homework, materials, payment, registration, reports,
-                      schedule, start)
+                      schedule, start, teacher)
 from middlewares.auth import AuthMiddleware
 from scheduler.reminders import setup_scheduler
 from schema_migration import migrate_bookings, migrate_lessons_charged
@@ -119,6 +119,7 @@ async def main() -> None:
         materials.router,
         homework.router,
         admin.router,
+        teacher.router,
         start.fallback_router,
     )
 
