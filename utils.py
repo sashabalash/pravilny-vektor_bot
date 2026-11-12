@@ -64,7 +64,11 @@ def validate_name(raw: str) -> str | None:
 
 
 def validate_phone(raw: str) -> str | None:
-    """Белорусский номер: +375XXXXXXXXX. Принимает также 80XXXXXXXXX и 375XXXXXXXXX."""
+    """Белорусский (+375XXXXXXXXX) или российский мобильный (+79XXXXXXXXX) номер.
+
+    Белорусский: 375XXXXXXXXX или 80XXXXXXXXX.
+    Российский: +7 9XX..., 8 9XX..., 7 9XX... (11 цифр).
+    """
     raw = (raw or "").strip()
     if not _PHONE_CHARS_RE.match(raw):
         return None
@@ -73,6 +77,8 @@ def validate_phone(raw: str) -> str | None:
         return "+" + digits
     if digits.startswith("80") and len(digits) == 11:
         return "+375" + digits[2:]
+    if len(digits) == 11 and digits[0] in "78" and digits[1] == "9":
+        return "+7" + digits[1:]
     return None
 
 

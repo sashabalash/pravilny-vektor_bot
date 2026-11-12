@@ -59,7 +59,7 @@ async def msg_full_name(message: Message, state: FSMContext) -> None:
     await state.update_data(full_name=text)
     await state.set_state(Reg.phone)
     await message.answer(
-        "📞 Укажите номер телефона для связи (например: +375291234567).",
+        "📞 Укажите номер телефона для связи (например: +375291234567 или +79123456789).",
         reply_markup=back_to_menu_kb(),
     )
 

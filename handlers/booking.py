@@ -214,15 +214,15 @@ async def msg_name(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(name=name)
     await state.set_state(Funnel.phone)
-    await message.answer("📱 Введите номер телефона в формате <b>+375XXXXXXXXX</b>:")
+    await message.answer("📱 Введите номер телефона: <b>+375XXXXXXXXX</b> (Беларусь) или <b>+7XXXXXXXXXX</b> (Россия):")
 
 
 @router.message(Funnel.phone, F.text, ~F.text.startswith("/"))
 async def msg_phone(message: Message, state: FSMContext) -> None:
     phone = validate_phone(message.text)
     if not phone:
-        await message.answer("⚠️ Не похоже на белорусский номер. Формат: <b>+375291234567</b>")
-        return
+          await message.answer("⚠️ Не похоже на номер. Примеры: <b>+375291234567</b> или <b>+79123456789</b>")
+    return
     await state.update_data(phone=phone)
     data = await state.get_data()
     if data["role"] == "student":

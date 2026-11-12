@@ -45,7 +45,7 @@ TEXT_ONLY = F.text, ~F.text.startswith("/")
 
 FIELD_PROMPTS = {
     "full_name": "Введите новое имя и фамилию:",
-    "phone": "Введите телефон в формате +375XXXXXXXXX:",
+    "phone": "Введите телефон (+375XXXXXXXXX или +7XXXXXXXXXX):",
     "grade": "Введите класс (например 9 или 11А):",
     "subject": "Введите предмет:",
     "child_name": "Введите имя и фамилию ребёнка:",

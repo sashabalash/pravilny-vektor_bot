@@ -59,13 +59,13 @@ def _rate_limited(ip: str) -> bool:
 
 
 def _client_ip(request: web.Request) -> str:
-    forwarded = request.headers.get("X-Forwarded-For", "")
-    if forwarded:
-        first = forwarded.split(",")[0].strip()
-        if first:
-            return first
+    # Запрос приходит от nginx с loopback-адреса. Настоящий IP посетителя
+    # выставляет Cloudflare в заголовке CF-Connecting-IP.
+    if request.remote in ("127.0.0.1", "::1"):
+        cf_ip = request.headers.get("CF-Connecting-IP", "").strip()
+        if cf_ip:
+            return cf_ip
     return request.remote or "unknown"
-
 
 # --- валидация -------------------------------------------------------------
 _CTRL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
